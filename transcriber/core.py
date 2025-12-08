@@ -16,6 +16,19 @@ DEFAULT_MODELS = {
     'standard': 'large-v3-turbo',
 }
 
+# MLX model mappings
+MLX_MODEL_MAPPINGS = {
+    'large-v3': 'mlx-community/whisper-large-v3',
+    'large-v3-turbo': 'mlx-community/whisper-large-v3-turbo',
+    'large-v2': 'mlx-community/whisper-large-v2',
+    'large': 'mlx-community/whisper-large-v3',
+    'medium': 'mlx-community/whisper-medium',
+    'small': 'mlx-community/whisper-small',
+    'base': 'mlx-community/whisper-base',
+    'tiny': 'mlx-community/whisper-tiny',
+    'turbo': 'mlx-community/whisper-large-v3-turbo',
+}
+
 class Transcriber:
     """Wrapper for multiple Whisper backends (MLX, Faster-Whisper, OpenAI)."""
     
@@ -51,31 +64,51 @@ class Transcriber:
         if not model_path:
             return DEFAULT_MODELS[self._backend]
         
-        if 'mlx' in model_path.lower() and self._backend != 'mlx':
+        # For MLX backend
+        if self._backend == 'mlx':
+            # If it's already an MLX model path (contains 'mlx-community/' or similar), use as-is
+            if 'mlx-community/' in model_path.lower() or '/' in model_path:
+                return model_path
+            # Otherwise, try to map common model names to MLX equivalents
+            if model_path.lower() in MLX_MODEL_MAPPINGS:
+                mlx_model = MLX_MODEL_MAPPINGS[model_path.lower()]
+                log.info(f"Mapping '{model_path}' to MLX model: {mlx_model}")
+                return mlx_model
+            # If unknown, try the mlx-community prefix
+            mlx_model = f"mlx-community/whisper-{model_path}"
+            log.info(f"Trying MLX model: {mlx_model}")
+            return mlx_model
+        
+        # For Faster-Whisper and Standard backends
+        # If user specified an MLX path but we're not using MLX backend
+        if 'mlx-community/' in model_path.lower():
+            # Extract the model name from MLX path
+            # e.g., "mlx-community/whisper-large-v3" -> "large-v3"
+            parts = model_path.split('/')
+            if len(parts) > 1:
+                model_name = parts[-1].replace('whisper-', '')
+                log.warning(f"MLX model '{model_path}' not compatible with {self._backend} backend.")
+                log.info(f"Using model: {model_name}")
+                return model_name
             log.warning(f"MLX model '{model_path}' not compatible with {self._backend} backend.")
             log.info(f"Using default model: {DEFAULT_MODELS[self._backend]}")
             return DEFAULT_MODELS[self._backend]
-    
-        if 'mlx' not in model_path.lower() and self._backend == 'mlx':
-            log.warning(f"Model '{model_path}' not compatible with MLX backend.")
-            log.info(f"Using default MLX model: {DEFAULT_MODELS['mlx']}")
-            return DEFAULT_MODELS['mlx']
         
         return model_path
 
     def _setup_device(self):
         if self._backend == 'mlx':
-            log.info("Backend: MLX-Whisper (Apple Silicon)")
+            log.info(f"Backend: MLX-Whisper (Apple Silicon) | Model: {self.model_path}")
                 
         elif self._backend == 'faster':
             import torch
             self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
             self.compute_type = 'float16' if self.device == 'cuda' else 'int8'
-            log.info(f"Backend: Faster-Whisper ({self.device.upper()})")
+            log.info(f"Backend: Faster-Whisper ({self.device.upper()}) | Model: {self.model_path}")
         else:
             import torch
             self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-            log.info(f"Backend: Standard Whisper ({self.device.upper()})")
+            log.info(f"Backend: Standard Whisper ({self.device.upper()}) | Model: {self.model_path}")
 
     def transcribe(self, audio_path: str, lang: str = None):
         log.info(f"Transcribing {audio_path}...")
