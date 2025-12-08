@@ -198,21 +198,32 @@ alert('Copied to clipboard!');
 }}
 }}
 
-function downloadExport(){{
+async function downloadExport(){{
 const ext=currentExportFilename.split('.').pop();
 const mt=ext==='csv'?'text/csv':'text/plain';
-try{{
 const b=new Blob([currentExportContent],{{type:mt+';charset=utf-8'}});
+
+// Try Web Share API first (works on mobile for saving files)
+if(navigator.canShare && navigator.canShare({{files:[new File([b],currentExportFilename,{{type:mt}})]}}) ){{
+try{{
+const file=new File([b],currentExportFilename,{{type:mt}});
+await navigator.share({{files:[file],title:'Vocabulary Export'}});
+return;
+}}catch(e){{if(e.name!=='AbortError')console.log('Share failed:',e);}}
+}}
+
+// Fallback to traditional download (works on desktop)
+try{{
 const u=URL.createObjectURL(b);
 const a=document.createElement('a');
-a.style.display='none';
 a.href=u;
 a.download=currentExportFilename;
 document.body.appendChild(a);
 a.click();
-setTimeout(()=>{{document.body.removeChild(a);URL.revokeObjectURL(u);}},100);
+document.body.removeChild(a);
+URL.revokeObjectURL(u);
 }}catch(e){{
-alert('Download not supported on this device. Please use Copy to Clipboard instead.');
+alert('Download not supported. Please use Copy to Clipboard instead.');
 }}
 }}
 
@@ -422,21 +433,32 @@ alert('Copied to clipboard!');
 }}
 }}
 
-function downloadExport(){{
+async function downloadExport(){{
 const ext=currentExportFilename.split('.').pop();
 const mt=ext==='csv'?'text/csv':'text/plain';
-try{{
 const b=new Blob([currentExportContent],{{type:mt+';charset=utf-8'}});
+
+// Try Web Share API first (works on mobile for saving files)
+if(navigator.canShare && navigator.canShare({{files:[new File([b],currentExportFilename,{{type:mt}})]}}) ){{
+try{{
+const file=new File([b],currentExportFilename,{{type:mt}});
+await navigator.share({{files:[file],title:'Vocabulary Export'}});
+return;
+}}catch(e){{if(e.name!=='AbortError')console.log('Share failed:',e);}}
+}}
+
+// Fallback to traditional download (works on desktop)
+try{{
 const u=URL.createObjectURL(b);
 const a=document.createElement('a');
-a.style.display='none';
 a.href=u;
 a.download=currentExportFilename;
 document.body.appendChild(a);
 a.click();
-setTimeout(()=>{{document.body.removeChild(a);URL.revokeObjectURL(u);}},100);
+document.body.removeChild(a);
+URL.revokeObjectURL(u);
 }}catch(e){{
-alert('Download not supported on this device. Please use Copy to Clipboard instead.');
+alert('Download not supported. Please use Copy to Clipboard instead.');
 }}
 }}
 
