@@ -16,16 +16,16 @@ DEFAULT_MODELS = {
     'standard': 'large-v3-turbo',
 }
 
-# MLX model mappings
+# MLX model mappings f
 MLX_MODEL_MAPPINGS = {
-    'large-v3': 'mlx-community/whisper-large-v3',
+    'large-v3': 'mlx-community/whisper-large-v3-mlx',
     'large-v3-turbo': 'mlx-community/whisper-large-v3-turbo',
-    'large-v2': 'mlx-community/whisper-large-v2',
-    'large': 'mlx-community/whisper-large-v3',
-    'medium': 'mlx-community/whisper-medium',
-    'small': 'mlx-community/whisper-small',
-    'base': 'mlx-community/whisper-base',
-    'tiny': 'mlx-community/whisper-tiny',
+    'large-v2': 'mlx-community/whisper-large-v2-mlx',
+    'large': 'mlx-community/whisper-large-v3-mlx',
+    'medium': 'mlx-community/whisper-medium-mlx',
+    'small': 'mlx-community/whisper-small-mlx',
+    'base': 'mlx-community/whisper-base-mlx',
+    'tiny': 'mlx-community/whisper-tiny-mlx',
     'turbo': 'mlx-community/whisper-large-v3-turbo',
 }
 
@@ -74,8 +74,8 @@ class Transcriber:
                 mlx_model = MLX_MODEL_MAPPINGS[model_path.lower()]
                 log.info(f"Mapping '{model_path}' to MLX model: {mlx_model}")
                 return mlx_model
-            # If unknown, try the mlx-community prefix
-            mlx_model = f"mlx-community/whisper-{model_path}"
+            # If unknown, try the mlx-community prefix with -mlx suffix
+            mlx_model = f"mlx-community/whisper-{model_path}-mlx"
             log.info(f"Trying MLX model: {mlx_model}")
             return mlx_model
         
