@@ -4,6 +4,9 @@ import re
 import subprocess
 import logging
 import platform
+import tempfile
+import os
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from .config import SPACY_MODELS, LANG_ALIASES
 
@@ -16,7 +19,7 @@ DEFAULT_MODELS = {
     'standard': 'large-v3-turbo',
 }
 
-# MLX model mappings f
+# MLX model mappings
 MLX_MODEL_MAPPINGS = {
     'large-v3': 'mlx-community/whisper-large-v3-mlx',
     'large-v3-turbo': 'mlx-community/whisper-large-v3-turbo',
@@ -28,6 +31,7 @@ MLX_MODEL_MAPPINGS = {
     'tiny': 'mlx-community/whisper-tiny-mlx',
     'turbo': 'mlx-community/whisper-large-v3-turbo',
 }
+
 
 class Transcriber:
     """Wrapper for multiple Whisper backends (MLX, Faster-Whisper, OpenAI)."""
@@ -43,13 +47,15 @@ class Transcriber:
             import mlx_whisper
             self.lib = mlx_whisper
             return 'mlx'
-        except ImportError: pass
+        except ImportError:
+            pass
         
         try:
             import faster_whisper
             self.lib = faster_whisper
             return 'faster'
-        except ImportError: pass
+        except ImportError:
+            pass
         
         try:
             import whisper
@@ -66,24 +72,18 @@ class Transcriber:
         
         # For MLX backend
         if self._backend == 'mlx':
-            # If it's already an MLX model path (contains 'mlx-community/' or similar), use as-is
             if 'mlx-community/' in model_path.lower() or '/' in model_path:
                 return model_path
-            # Otherwise, try to map common model names to MLX equivalents
             if model_path.lower() in MLX_MODEL_MAPPINGS:
                 mlx_model = MLX_MODEL_MAPPINGS[model_path.lower()]
                 log.info(f"Mapping '{model_path}' to MLX model: {mlx_model}")
                 return mlx_model
-            # If unknown, try the mlx-community prefix with -mlx suffix
             mlx_model = f"mlx-community/whisper-{model_path}-mlx"
             log.info(f"Trying MLX model: {mlx_model}")
             return mlx_model
         
         # For Faster-Whisper and Standard backends
-        # If user specified an MLX path but we're not using MLX backend
         if 'mlx-community/' in model_path.lower():
-            # Extract the model name from MLX path
-            # e.g., "mlx-community/whisper-large-v3" -> "large-v3"
             parts = model_path.split('/')
             if len(parts) > 1:
                 model_name = parts[-1].replace('whisper-', '')
@@ -116,14 +116,24 @@ class Transcriber:
         
         # --- MLX BACKEND ---
         if self._backend == 'mlx':
+            # Try to get VAD timestamps first
+            clip_timestamps = self._get_vad_timestamps(audio_path)
+            
             params = {
                 'word_timestamps': True,
                 'verbose': False,
                 'path_or_hf_repo': self.model_path,
-                'condition_on_previous_text': False,
-                'no_speech_threshold': None,
+                'condition_on_previous_text': True,  # Enable for better continuity
+                'no_speech_threshold': 0.6,
                 'compression_ratio_threshold': 2.4,
+                'logprob_threshold': -1.0,
             }
+            
+            # Add clip_timestamps if VAD detected speech segments
+            if clip_timestamps:
+                log.info(f"Using VAD-guided transcription with {len(clip_timestamps)//2} speech segments")
+                params['clip_timestamps'] = clip_timestamps
+            
             if lang:
                 params['language'] = lang
 
@@ -179,6 +189,146 @@ class Transcriber:
         res = self._model.transcribe(audio_path, **params)
         return res, time.time() - start_time, res.get('language', lang)
 
+    def _get_vad_timestamps(self, audio_path: str) -> list:
+        """
+        Use Voice Activity Detection to find speech segments.
+        Returns clip_timestamps list for mlx-whisper.
+        Falls back to ffmpeg-based silence detection if VAD is not available.
+        """
+        try:
+            # Try silero-vad first (best quality)
+            return self._silero_vad(audio_path)
+        except Exception as e:
+            log.debug(f"Silero VAD not available: {e}")
+        
+        try:
+            # Fall back to ffmpeg-based silence detection
+            return self._ffmpeg_vad(audio_path)
+        except Exception as e:
+            log.debug(f"FFmpeg VAD failed: {e}")
+        
+        # No VAD available, return empty (will use default behavior)
+        return []
+
+    def _silero_vad(self, audio_path: str) -> list:
+        """Use Silero VAD for speech detection."""
+        import torch
+        
+        # Load audio
+        import torchaudio
+        wav, sr = torchaudio.load(audio_path)
+        
+        # Resample to 16kHz if needed
+        if sr != 16000:
+            resampler = torchaudio.transforms.Resample(sr, 16000)
+            wav = resampler(wav)
+            sr = 16000
+        
+        # Convert to mono if stereo
+        if wav.shape[0] > 1:
+            wav = wav.mean(dim=0, keepdim=True)
+        
+        wav = wav.squeeze()
+        
+        # Load Silero VAD
+        model, utils = torch.hub.load(
+            repo_or_dir='snakers4/silero-vad',
+            model='silero_vad',
+            force_reload=False
+        )
+        
+        (get_speech_timestamps, _, _, _, _) = utils
+        
+        # Get speech timestamps
+        speech_timestamps = get_speech_timestamps(
+            wav, model,
+            sampling_rate=sr,
+            threshold=0.5,
+            min_speech_duration_ms=250,
+            min_silence_duration_ms=100,
+            speech_pad_ms=30
+        )
+        
+        if not speech_timestamps:
+            return []
+        
+        # Convert to clip_timestamps format (alternating start/end times)
+        clip_timestamps = []
+        for ts in speech_timestamps:
+            start_sec = ts['start'] / sr
+            end_sec = ts['end'] / sr
+            clip_timestamps.append(start_sec)
+            clip_timestamps.append(end_sec)
+        
+        # Ensure we don't end exactly at file duration (known mlx-whisper bug)
+        if clip_timestamps:
+            duration = len(wav) / sr
+            if clip_timestamps[-1] >= duration - 0.1:
+                clip_timestamps[-1] = duration - 0.1
+        
+        return clip_timestamps
+
+    def _ffmpeg_vad(self, audio_path: str) -> list:
+        """Use FFmpeg silence detection as fallback VAD."""
+        # Get audio duration first
+        dur_cmd = [
+            'ffprobe', '-v', 'quiet', '-show_entries', 'format=duration',
+            '-of', 'default=noprint_wrappers=1:nokey=1', audio_path
+        ]
+        result = subprocess.run(dur_cmd, capture_output=True, text=True)
+        duration = float(result.stdout.strip())
+        
+        # Detect silence
+        cmd = [
+            'ffmpeg', '-i', audio_path,
+            '-af', 'silencedetect=noise=-30dB:d=0.5',
+            '-f', 'null', '-'
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        # Parse silence periods
+        silence_starts = []
+        silence_ends = []
+        
+        for line in result.stderr.split('\n'):
+            if 'silence_start' in line:
+                match = re.search(r'silence_start:\s*([\d.]+)', line)
+                if match:
+                    silence_starts.append(float(match.group(1)))
+            elif 'silence_end' in line:
+                match = re.search(r'silence_end:\s*([\d.]+)', line)
+                if match:
+                    silence_ends.append(float(match.group(1)))
+        
+        # Convert silence periods to speech periods
+        speech_segments = []
+        
+        # Add initial speech segment if audio doesn't start with silence
+        if not silence_starts or silence_starts[0] > 0.1:
+            speech_start = 0
+            speech_end = silence_starts[0] if silence_starts else duration
+            if speech_end - speech_start > 0.3:
+                speech_segments.append((speech_start, speech_end))
+        
+        # Add speech segments between silence periods
+        for i, silence_end in enumerate(silence_ends):
+            speech_start = silence_end
+            if i + 1 < len(silence_starts):
+                speech_end = silence_starts[i + 1]
+            else:
+                speech_end = duration
+            
+            if speech_end - speech_start > 0.3:
+                speech_segments.append((speech_start, min(speech_end, duration - 0.1)))
+        
+        # Convert to clip_timestamps format
+        clip_timestamps = []
+        for start, end in speech_segments:
+            clip_timestamps.append(start)
+            clip_timestamps.append(end)
+        
+        return clip_timestamps
+
 
 class NLPProcessor:
     """Handles Translation and Lemmatization."""
@@ -190,8 +340,6 @@ class NLPProcessor:
         self.spacy_lib = self._load_spacy()
 
     def _load_voikko(self):
-        # Voikko requires native DLLs that are not available via pip on Windows
-        # On Windows, fall back to spaCy for Finnish lemmatization
         if platform.system() == 'Windows':
             log.info("Windows detected: using spaCy for Finnish lemmatization (Voikko not supported).")
             return None
@@ -199,7 +347,6 @@ class NLPProcessor:
         try:
             import libvoikko
             voikko_instance = libvoikko.Voikko('fi')
-            # Test that it actually works
             voikko_instance.analyze('testi')
             log.info("Voikko loaded for Finnish lemmatization.")
             return voikko_instance
@@ -219,12 +366,15 @@ class NLPProcessor:
         try:
             import spacy
             return spacy
-        except ImportError: return None
+        except ImportError:
+            return None
 
     def _get_spacy_model(self, lang):
-        if lang in self._spacy_cache: return self._spacy_cache[lang]
+        if lang in self._spacy_cache:
+            return self._spacy_cache[lang]
         model_name = SPACY_MODELS.get(lang)
-        if not model_name or not self.spacy_lib: return None
+        if not model_name or not self.spacy_lib:
+            return None
         
         try:
             nlp = self.spacy_lib.load(model_name)
@@ -239,24 +389,27 @@ class NLPProcessor:
 
     def lemmatize(self, word: str, lang: str) -> str:
         word = re.sub(r'[^\w\-]', '', word).strip()
-        if not word: return None
+        if not word:
+            return None
         
         lang = LANG_ALIASES.get(lang, lang)
         
-        # Finnish: use Voikko if available (macOS/Linux), otherwise fall back to spaCy
         if lang == 'fi' and self.voikko:
             try:
                 a = self.voikko.analyze(word)
-                if a: return a[0].get('BASEFORM')
-            except: pass
+                if a:
+                    return a[0].get('BASEFORM')
+            except:
+                pass
             
-        # SpaCy for all languages (including Finnish on Windows)
         nlp = self._get_spacy_model(lang)
         if nlp:
             try:
                 doc = nlp(word)
-                if doc: return doc[0].lemma_
-            except: pass
+                if doc:
+                    return doc[0].lemma_
+            except:
+                pass
             
         return None
 
@@ -268,11 +421,14 @@ class NLPProcessor:
         results = [None] * len(texts)
         
         def _task(idx, text):
-            if not text.strip(): return idx, ''
+            if not text.strip():
+                return idx, ''
             t = self.translator_cls(source=src, target=tgt)
-            for _ in range(3): # Retry logic
-                try: return idx, t.translate(text.strip())
-                except: time.sleep(0.3)
+            for _ in range(3):
+                try:
+                    return idx, t.translate(text.strip())
+                except:
+                    time.sleep(0.3)
             return idx, '[Error]'
 
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -281,7 +437,8 @@ class NLPProcessor:
                 try:
                     i, res = f.result()
                     results[i] = res
-                except: pass
+                except:
+                    pass
         return results
 
     def build_vocabulary(self, segments, src, tgt):
@@ -289,26 +446,28 @@ class NLPProcessor:
         for s in segments:
             for w in s.get('words', []):
                 clean = re.sub(r'[^\w\-]', '', w['text']).strip().lower()
-                if len(clean) > 1: words.add(clean)
+                if len(clean) > 1:
+                    words.add(clean)
                 
         log.info(f"Building vocabulary ({len(words)} words)...")
         vocab = {}
         
-        # Lemmatize
         for w in words:
             base = self.lemmatize(w, src) or w
             vocab[w] = {'baseform': base, 'translation': None}
             
-        # Translate baseforms
         if self.translator_cls and src != tgt:
             def _trans(w, base):
-                try: return w, self.translator_cls(source=src, target=tgt).translate(base)
-                except: return w, None
+                try:
+                    return w, self.translator_cls(source=src, target=tgt).translate(base)
+                except:
+                    return w, None
                 
             with ThreadPoolExecutor(max_workers=10) as pool:
                 futures = [pool.submit(_trans, w, vocab[w]['baseform']) for w in words]
                 for f in as_completed(futures):
                     w, t = f.result()
-                    if t: vocab[w]['translation'] = t
+                    if t:
+                        vocab[w]['translation'] = t
                     
         return vocab
